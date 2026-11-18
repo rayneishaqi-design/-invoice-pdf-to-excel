@@ -1,333 +1,792 @@
+import streamlit as st
+import pdfplumber
+import pandas as pd
+import zipfile
 import io
 import re
-import zipfile
-from pathlib import Path
+import os
 from datetime import datetime
 
-import pandas as pd
-import pdfplumber
-import streamlit as st
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.utils import get_column_letter
-
+# ============================================================
+# CONFIG
+# ============================================================
 
 st.set_page_config(
     page_title="Invoice PDF to Excel",
-    page_icon="📊",
+    page_icon="📄",
     layout="wide"
 )
 
+st.title("📄 Invoice PDF → Excel")
+st.caption(
+    "Upload ZIP berisi invoice PDF. Sistem akan membaca seluruh halaman "
+    "dan menggabungkan hasilnya menjadi satu file Excel."
+)
+
+# ============================================================
+# MASTER DATA
+# ============================================================
+
+BRANDS = [
+    "Hanasui",
+    "NCO",
+    "Fyne",
+    "Cave",
+    "Yummys",
+    "BHST",
+    "Essens",
+    "BMYT",
+    "Hexxa",
+    "NDR",
+    "Jamu Jago",
+    "Teratu",
+    "Ultimate U",
+    "Bumi Tauhid",
+    "Safwan",
+    "Attaqwa",
+    "Aqshor",
+]
+
 WAREHOUSES = [
-    "Medan", "Padang", "Palembang", "Yogyakarta", "Surabaya",
-    "Malang", "Makassar", "Banjarmasin", "Bekasi", "Jakarta"
+    "Medan",
+    "Padang",
+    "Palembang",
+    "Yogyakarta",
+    "Surabaya",
+    "Malang",
+    "Makassar",
+    "Banjarmasin",
+    "Bekasi",
+    "Jakarta",
 ]
 
-OUTPUT_COLUMNS = [
-    "No", "Tanggal Invoice", "Nama Store", "Brand",
-    "Nomor Invoice", "Nominal", "Warehouse", "Nomor Faktur Pajak"
-]
+# ============================================================
+# HELPER
+# ============================================================
 
-BRAND_RULES = [
-    ("Focallure", ("FOCALLURE",)),
-    ("Pinkflash", ("PINKFLASH", "PINK FLASH")),
-    ("Cave", ("CAVE",)),
-    ("Teratu", ("TERATU",)),
-    ("Philips", ("PHILIPS",)),
-]
+def clean_text(text):
+    if not text:
+        return ""
 
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
 
-def tidy(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    return text.strip()
 
 
-def parse_amount(value):
-    """Ubah angka format Indonesia, misalnya 151.740,00 menjadi integer 151740."""
-    value = tidy(value).replace("Rp", "").replace(" ", "")
-    value = value.replace(".", "").replace(",", ".")
+def normalize_number(value):
+    """
+    Mengubah angka invoice menjadi numeric.
+    Contoh:
+    Rp 3.003.880,00 -> 3003880
+    3,003,880.00    -> 3003880
+    """
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    # Hapus Rp dan karakter non angka kecuali separator
+    value = re.sub(r"(?i)rp", "", value)
+    value = value.strip()
+
+    if not value:
+        return None
+
+    # Format Indonesia: 151.740,00
+    if "," in value and "." in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "")
+            value = value.replace(",", ".")
+        else:
+            value = value.replace(",", "")
+
+    # 151.740,00
+    elif "," in value:
+        decimal_part = value.split(",")[-1]
+
+        if len(decimal_part) <= 2:
+            value = value.replace(".", "")
+            value = value.replace(",", ".")
+        else:
+            value = value.replace(",", "")
+
+    # 151.740
+    elif "." in value:
+        parts = value.split(".")
+
+        if len(parts[-1]) == 2:
+            value = value.replace(".", "")
+        else:
+            value = value.replace(".", "")
+
     try:
-        return int(round(float(value)))
-    except (TypeError, ValueError):
+        number = float(value)
+
+        if number.is_integer():
+            return int(number)
+
+        return number
+
+    except:
         return None
 
 
-def parse_date(value):
-    value = tidy(value)
-    month_map = {
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "mei": 5, "may": 5,
-        "jun": 6, "jul": 7, "agu": 8, "aug": 8, "sep": 9, "okt": 10,
-        "oct": 10, "nov": 11, "des": 12, "dec": 12
-    }
-    match = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", value)
-    if not match:
-        return value
-    day, month_name, year = match.groups()
-    month = month_map.get(month_name[:3].lower())
-    if not month:
-        return value
-    return datetime(int(year), month, int(day))
+# ============================================================
+# DETECT BRAND
+# ============================================================
 
+def detect_brand(text, filename=""):
+    """
+    Mencari brand berdasarkan isi PDF.
+    Jika tidak ditemukan, coba dari nama file.
+    """
 
-def detect_brand(line):
-    upper = line.upper()
-    for brand, keywords in BRAND_RULES:
-        if any(keyword in upper for keyword in keywords):
+    combined = f"{text}\n{filename}".lower()
+
+    # Prioritaskan brand yang lebih spesifik
+    sorted_brands = sorted(
+        BRANDS,
+        key=lambda x: len(x),
+        reverse=True
+    )
+
+    for brand in sorted_brands:
+        if brand.lower() in combined:
             return brand
+
+    return ""
+
+
+# ============================================================
+# DETECT INVOICE NUMBER
+# ============================================================
+
+def detect_invoice_number(text):
+    patterns = [
+        r"(?:invoice\s*(?:no|number|#)?|no\.?\s*invoice|nomor\s*invoice)"
+        r"\s*[:#\-]?\s*([A-Z0-9./\-]+)",
+
+        r"\b(SI\.[0-9]{4}\.[0-9]{2}\.[0-9]+)\b",
+
+        r"\b(INV[./\-]?[A-Z0-9./\-]+)\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1).strip()
+
+    return ""
+
+
+# ============================================================
+# DETECT DATE
+# ============================================================
+
+def detect_invoice_date(text):
+    patterns = [
+        # 17/11/2026
+        r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
+
+        # 17-11-2026
+        r"\b(\d{1,2}-\d{1,2}-\d{4})\b",
+
+        # 17 Nov 2026
+        r"\b(\d{1,2}\s+"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"\s+\d{4})\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            value = match.group(1)
+
+            # dd/mm/yyyy
+            for fmt in [
+                "%d/%m/%Y",
+                "%d-%m-%Y",
+                "%d %b %Y",
+            ]:
+                try:
+                    return datetime.strptime(
+                        value,
+                        fmt
+                    ).strftime("%d/%m/%Y")
+                except:
+                    pass
+
+    return ""
+
+
+# ============================================================
+# DETECT STORE
+# ============================================================
+
+def detect_store(text):
+    """
+    Mencari nama toko berdasarkan label yang umum ditemukan
+    pada invoice.
+    """
+
+    patterns = [
+        r"(?:customer|pelanggan|customer name|nama pelanggan)"
+        r"\s*[:\-]\s*(.+)",
+
+        r"(?:bill\s*to|ship\s*to)"
+        r"\s*[:\-]\s*(.+)",
+
+        r"(?:store|toko|outlet)"
+        r"\s*[:\-]\s*(.+)",
+    ]
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            result = match.group(1).strip()
+
+            # Ambil hanya sampai akhir baris
+            result = result.split("\n")[0].strip()
+
+            if len(result) > 1:
+                return result
+
+    # Fallback:
+    # cari baris yang mengandung nama toko umum
+    blacklist = [
+        "invoice",
+        "tanggal",
+        "date",
+        "total",
+        "subtotal",
+        "alamat",
+        "address",
+        "phone",
+        "telp",
+        "produk",
+        "qty",
+        "harga",
+    ]
+
+    for line in lines[:30]:
+
+        lower = line.lower()
+
+        if any(word in lower for word in blacklist):
+            continue
+
+        if len(line) >= 4 and len(line) <= 80:
+            # Hindari baris yang hanya angka
+            if not re.fullmatch(r"[\d\s.,:/\-]+", line):
+                return line
+
+    return ""
+
+
+# ============================================================
+# DETECT TOTAL
+# ============================================================
+
+def detect_total(text):
+    """
+    Mengambil nilai TOTAL invoice.
+
+    Prioritas:
+    1. TOTAL
+    2. GRAND TOTAL
+    3. TOTAL INVOICE
+    """
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    # Cari dari baris yang mengandung TOTAL
+    for i, line in enumerate(lines):
+
+        if re.search(
+            r"\b(grand\s+total|total\s+invoice|total)\b",
+            line,
+            flags=re.IGNORECASE
+        ):
+
+            # Cari angka di baris yang sama
+            numbers = re.findall(
+                r"(?:Rp\s*)?[\d.,]+",
+                line,
+                flags=re.IGNORECASE
+            )
+
+            if numbers:
+                candidates = [
+                    normalize_number(x)
+                    for x in numbers
+                ]
+
+                candidates = [
+                    x for x in candidates
+                    if x is not None
+                ]
+
+                if candidates:
+                    return candidates[-1]
+
+            # Kalau angka ada di baris berikutnya
+            for next_line in lines[i + 1:i + 3]:
+
+                numbers = re.findall(
+                    r"(?:Rp\s*)?[\d.,]+",
+                    next_line,
+                    flags=re.IGNORECASE
+                )
+
+                if numbers:
+
+                    candidates = [
+                        normalize_number(x)
+                        for x in numbers
+                    ]
+
+                    candidates = [
+                        x for x in candidates
+                        if x is not None
+                    ]
+
+                    if candidates:
+                        return candidates[-1]
+
+    # Fallback: cari angka terbesar yang diawali Rp
+    rp_values = re.findall(
+        r"(?:Rp\s*)[\d.,]+",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    values = []
+
+    for value in rp_values:
+        number = normalize_number(value)
+
+        if number is not None:
+            values.append(number)
+
+    if values:
+        return max(values)
+
     return None
 
 
+# ============================================================
+# EXTRACT ONE PDF
+# ============================================================
+
 def extract_pdf(pdf_bytes, filename):
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        pages_text = [page.extract_text() or "" for page in pdf.pages]
-    text = "\n".join(pages_text)
-    lines = [tidy(line) for line in text.splitlines() if tidy(line)]
+    """
+    Membaca SELURUH halaman PDF.
 
-    invoice_match = re.search(
-        r"\bSI[.-]\d{4}[.-]\d{2}[.-]\d{5}\b", text, re.I
-    )
-    invoice_number = invoice_match.group(0).replace("-", ".") if invoice_match else Path(filename).stem
+    Tidak hanya halaman pertama.
+    """
 
-    date_match = re.search(
-        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|Mei|May|Jun|Jul|Agu|Aug|Sep|Okt|Oct|Nov|Des|Dec)[a-z]*\s+\d{4})\b",
-        text, re.I
-    )
-    invoice_date = parse_date(date_match.group(1)) if date_match else ""
+    all_text = []
+    page_count = 0
 
-    # Nama pelanggan berada pada baris setelah baris "Kepada : Tanggal Nomor".
-    store = ""
-    for i, line in enumerate(lines):
-        if line.lower().startswith("kepada"):
-            for candidate in lines[i + 1:i + 4]:
-                if re.search(r"\bSI[.-]\d{4}[.-]\d{2}[.-]\d{5}\b", candidate, re.I):
-                    continue
-                if re.search(r"syarat pembayaran|tanggal jatuh tempo|net\s*\d+", candidate, re.I):
-                    continue
-                # Baris alamat biasanya diawali Jl./Jalan, bukan nama pelanggan.
-                if re.match(r"^(Jl\.?|Jalan|Jln\.?)\b", candidate, re.I):
-                    continue
-                if candidate.lower() not in ("tanggal nomor",):
-                    store = candidate
-                    break
-            break
+    try:
 
-    # Umumnya nama toko adalah bagian setelah tanda hubung pada "Bp. Nama - Nama Toko".
-    if " - " in store:
-        store = store.split(" - ", 1)[1].strip()
+        with pdfplumber.open(
+            io.BytesIO(pdf_bytes)
+        ) as pdf:
 
-    # TOTAL invoice adalah angka pada baris yang labelnya tepat "Total".
-    total_match = re.search(r"(?im)^\s*Total\s+([\d.,]+)\s*$", text)
-    invoice_total = parse_amount(total_match.group(1)) if total_match else None
+            page_count = len(pdf.pages)
 
-    # Baca jumlah per brand dari kolom Total Harga pada baris item.
-    # Jika PDF hanya memiliki satu brand, gunakan angka TOTAL invoice sebagai nominal.
-    brand_amounts = {}
-    for line in lines:
-        brand = detect_brand(line)
-        if not brand:
-            continue
+            for page in pdf.pages:
 
-        # Baris produk invoice berakhir dengan nilai Total Harga.
-        # Ambil angka terakhir yang berdiri sendiri pada baris produk.
-        amounts = re.findall(r"(?<![\w])(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)(?![\w])", line)
-        if not amounts:
-            continue
-        line_amount = parse_amount(amounts[-1])
-        if line_amount is not None:
-            brand_amounts[brand] = brand_amounts.get(brand, 0) + line_amount
+                text = page.extract_text(
+                    x_tolerance=2,
+                    y_tolerance=2
+                )
 
-    if len(brand_amounts) == 1:
-        brand, _ = next(iter(brand_amounts.items()))
-        brand_amounts = {brand: invoice_total if invoice_total is not None else next(iter(brand_amounts.values()))}
-    elif not brand_amounts:
-        brand_amounts = {"Perlu diperiksa": invoice_total}
+                if text:
+                    all_text.append(text)
 
-    records = []
-    for brand, amount in brand_amounts.items():
-        records.append({
-            "Tanggal Invoice": invoice_date,
-            "Nama Store": store,
-            "Brand": brand,
-            "Nomor Invoice": invoice_number,
-            "Nominal": amount,
-            "Warehouse": "",
-            "Nomor Faktur Pajak": ""
-        })
+    except Exception as e:
 
-    return records, {
-        "filename": filename,
-        "invoice_total": invoice_total,
-        "brand_count": len(brand_amounts),
-        "store": store,
-        "invoice_number": invoice_number
+        return {
+            "success": False,
+            "error": str(e),
+            "pages": 0
+        }
+
+    combined_text = "\n".join(all_text)
+    combined_text = clean_text(combined_text)
+
+    return {
+        "success": True,
+        "pages": page_count,
+        "text": combined_text,
+        "filename": filename
     }
 
 
-def build_excel(dataframe):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        dataframe[OUTPUT_COLUMNS].to_excel(
-            writer, index=False, sheet_name="Rekap Invoice"
-        )
-    output.seek(0)
+# ============================================================
+# PROCESS ZIP
+# ============================================================
 
-    workbook = load_workbook(output)
-    sheet = workbook["Rekap Invoice"]
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
-    sheet.sheet_view.showGridLines = False
+def process_zip(uploaded_file):
 
-    header_fill = PatternFill("solid", fgColor="17365D")
-    header_font = Font(name="Arial", bold=True, color="FFFFFF")
-    thin = Side(style="thin", color="D9E2F3")
+    results = []
+    debug_info = []
 
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    widths = [8, 18, 42, 18, 25, 20, 20, 25]
-    for index, width in enumerate(widths, start=1):
-        sheet.column_dimensions[get_column_letter(index)].width = width
-
-    for row in sheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = Font(name="Arial", size=10)
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            cell.border = Border(bottom=thin)
-        row[1].number_format = "dd/mm/yyyy"
-        row[5].number_format = '"Rp" #,##0'
-        row[7].number_format = "@"
-
-    if sheet.max_row >= 2:
-        validation = DataValidation(
-            type="list",
-            formula1='"' + ",".join(WAREHOUSES) + '"',
-            allow_blank=True
-        )
-        validation.error = "Pilih warehouse dari daftar."
-        validation.errorTitle = "Warehouse tidak valid"
-        validation.prompt = "Pilih warehouse untuk baris invoice ini."
-        validation.promptTitle = "Pilih Warehouse"
-        sheet.add_data_validation(validation)
-        validation.add(f"G2:G{sheet.max_row}")
-
-    final = io.BytesIO()
-    workbook.save(final)
-    final.seek(0)
-    return final.getvalue()
-
-
-st.title("📊 Invoice PDF to Excel")
-st.write(
-    "Aplikasi baru untuk menggabungkan beberapa invoice PDF dari satu file ZIP "
-    "menjadi satu file Excel."
-)
-
-st.markdown(
-    """
-    **Cara kerja:** unggah ZIP → aplikasi mengekstrak PDF → membaca data invoice →
-    pilih Warehouse → unduh Excel.
-    """
-)
-
-st.info(
-    "Nominal diambil dari angka pada baris **Total** invoice (contoh: 151.740,00). "
-    "Nomor Faktur Pajak dibiarkan kosong. Warehouse dipilih manual."
-)
-
-uploaded_zip = st.file_uploader(
-    "Upload file ZIP yang berisi PDF invoice",
-    type=["zip"],
-    help="ZIP boleh berisi banyak PDF invoice."
-)
-
-if uploaded_zip:
     try:
-        with zipfile.ZipFile(uploaded_zip) as archive:
+
+        zip_bytes = uploaded_file.read()
+
+        with zipfile.ZipFile(
+            io.BytesIO(zip_bytes),
+            "r"
+        ) as z:
+
             pdf_files = [
-                name for name in archive.namelist()
+                name
+                for name in z.namelist()
                 if name.lower().endswith(".pdf")
-                and not name.startswith("__MACOSX/")
+                and not name.endswith("/")
             ]
 
             if not pdf_files:
-                st.error("Tidak ada PDF yang ditemukan di dalam ZIP.")
-                st.stop()
+                st.error(
+                    "ZIP tidak berisi file PDF."
+                )
+                return pd.DataFrame()
 
-            all_records = []
-            read_errors = []
-            audit = []
+            progress = st.progress(0)
 
-            progress = st.progress(0, text="Membaca invoice...")
-            for index, filename in enumerate(pdf_files):
+            for index, pdf_name in enumerate(pdf_files):
+
                 try:
-                    records, info = extract_pdf(archive.read(filename), filename)
-                    all_records.extend(records)
-                    audit.append(info)
-                except Exception as exc:
-                    read_errors.append(f"{filename}: {exc}")
+
+                    pdf_bytes = z.read(pdf_name)
+
+                    extracted = extract_pdf(
+                        pdf_bytes,
+                        os.path.basename(pdf_name)
+                    )
+
+                    if not extracted["success"]:
+
+                        debug_info.append({
+                            "File": pdf_name,
+                            "Status": "Gagal",
+                            "Halaman": 0,
+                            "Error": extracted["error"]
+                        })
+
+                        continue
+
+                    text = extracted["text"]
+
+                    brand = detect_brand(
+                        text,
+                        pdf_name
+                    )
+
+                    invoice_number = detect_invoice_number(
+                        text
+                    )
+
+                    invoice_date = detect_invoice_date(
+                        text
+                    )
+
+                    store = detect_store(
+                        text
+                    )
+
+                    total = detect_total(
+                        text
+                    )
+
+                    results.append({
+                        "No": len(results) + 1,
+                        "Tanggal Invoice": invoice_date,
+                        "Nama Store": store,
+                        "Brand": brand,
+                        "Nomor Invoice": invoice_number,
+                        "Nominal": total,
+                        "Warehouse": "",
+                        "Nomor Faktur Pajak": ""
+                    })
+
+                    debug_info.append({
+                        "File": pdf_name,
+                        "Status": "OK",
+                        "Halaman": extracted["pages"],
+                        "Brand": brand,
+                        "Store": store,
+                        "Invoice": invoice_number,
+                        "Total": total
+                    })
+
+                except Exception as e:
+
+                    debug_info.append({
+                        "File": pdf_name,
+                        "Status": "Gagal",
+                        "Halaman": 0,
+                        "Error": str(e)
+                    })
+
                 progress.progress(
-                    (index + 1) / len(pdf_files),
-                    text=f"Membaca {index + 1} dari {len(pdf_files)} PDF"
+                    (index + 1) / len(pdf_files)
                 )
 
-        if read_errors:
-            st.warning("Ada PDF yang gagal dibaca:")
-            for message in read_errors:
-                st.write(f"- {message}")
+    except zipfile.BadZipFile:
 
-        if not all_records:
-            st.error("Data invoice belum berhasil dibaca. Periksa PDF yang diunggah.")
-            st.stop()
+        st.error(
+            "File yang diupload bukan ZIP yang valid."
+        )
 
-        dataframe = pd.DataFrame(all_records)
-        dataframe.insert(0, "No", range(1, len(dataframe) + 1))
+        return pd.DataFrame()
 
-        st.success(f"Berhasil membaca {len(pdf_files)} PDF dan menghasilkan {len(dataframe)} baris rekap.")
+    return pd.DataFrame(results), pd.DataFrame(debug_info)
 
-        with st.expander("Rincian pembacaan PDF"):
-            audit_df = pd.DataFrame(audit)
-            st.dataframe(audit_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Preview dan pilihan Warehouse")
-        st.caption("Pilih Warehouse pada setiap baris. Nomor Faktur Pajak tetap kosong.")
-        edited = st.data_editor(
-            dataframe[OUTPUT_COLUMNS],
+# ============================================================
+# UPLOAD
+# ============================================================
+
+uploaded_zip = st.file_uploader(
+    "Upload file ZIP berisi invoice PDF",
+    type=["zip"]
+)
+
+if uploaded_zip:
+
+    if "invoice_data" not in st.session_state:
+
+        st.session_state.invoice_data = pd.DataFrame()
+
+    if st.button(
+        "🔍 Proses ZIP",
+        type="primary"
+    ):
+
+        with st.spinner(
+            "Membaca seluruh PDF dan seluruh halaman..."
+        ):
+
+            result = process_zip(
+                uploaded_zip
+            )
+
+            if isinstance(result, tuple):
+
+                df, debug_df = result
+
+                st.session_state.invoice_data = df
+                st.session_state.debug_data = debug_df
+
+    # ========================================================
+    # PREVIEW
+    # ========================================================
+
+    df = st.session_state.get(
+        "invoice_data",
+        pd.DataFrame()
+    )
+
+    if not df.empty:
+
+        st.success(
+            f"Berhasil membaca {len(df)} invoice."
+        )
+
+        st.subheader(
+            "Preview dan pilihan Warehouse"
+        )
+
+        st.info(
+            "Pilih Warehouse pada setiap baris. "
+            "Nomor Faktur Pajak dibiarkan kosong."
+        )
+
+        # ----------------------------------------------------
+        # DATA EDITOR
+        # ----------------------------------------------------
+
+        edited_df = st.data_editor(
+            df,
             use_container_width=True,
             hide_index=True,
-            disabled=[column for column in OUTPUT_COLUMNS if column != "Warehouse"],
+            num_rows="fixed",
+
             column_config={
-                "Warehouse": st.column_config.SelectboxColumn(
-                    "Warehouse",
-                    options=WAREHOUSES,
-                    required=False
+
+                "No": st.column_config.NumberColumn(
+                    "No",
+                    disabled=True
                 ),
-                "Nominal": st.column_config.NumberColumn(
-                    "Nominal",
-                    format="Rp %d"
-                ),
-                "Tanggal Invoice": st.column_config.DateColumn(
-                    "Tanggal Invoice",
-                    format="DD/MM/YYYY"
-                )
+
+                "Tanggal Invoice":
+                    st.column_config.TextColumn(
+                        "Tanggal Invoice",
+                        disabled=True
+                    ),
+
+                "Nama Store":
+                    st.column_config.TextColumn(
+                        "Nama Store",
+                        disabled=False
+                    ),
+
+                "Brand":
+                    st.column_config.SelectboxColumn(
+                        "Brand",
+                        options=BRANDS,
+                        required=False
+                    ),
+
+                "Nomor Invoice":
+                    st.column_config.TextColumn(
+                        "Nomor Invoice",
+                        disabled=True
+                    ),
+
+                "Nominal":
+                    st.column_config.NumberColumn(
+                        "Nominal",
+                        format="Rp %d",
+                        disabled=False
+                    ),
+
+                "Warehouse":
+                    st.column_config.SelectboxColumn(
+                        "Warehouse",
+                        options=WAREHOUSES,
+                        required=False
+                    ),
+
+                "Nomor Faktur Pajak":
+                    st.column_config.TextColumn(
+                        "Nomor Faktur Pajak",
+                        required=False
+                    ),
             },
+
             key="invoice_editor"
         )
 
-        if st.button("Buat File Excel", type="primary", use_container_width=True):
-            excel_bytes = build_excel(edited)
-            st.download_button(
-                "⬇️ Download Rekap Invoice.xlsx",
-                data=excel_bytes,
-                file_name="Rekap_Invoice.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True
+        st.session_state.invoice_data = edited_df
+
+        # ====================================================
+        # DOWNLOAD EXCEL
+        # ====================================================
+
+        st.divider()
+
+        st.subheader(
+            "📊 Export Excel"
+        )
+
+        output = io.BytesIO()
+
+        with pd.ExcelWriter(
+            output,
+            engine="openpyxl"
+        ) as writer:
+
+            edited_df.to_excel(
+                writer,
+                index=False,
+                sheet_name="Invoice"
             )
 
-    except zipfile.BadZipFile:
-        st.error("File yang diunggah bukan ZIP yang valid.")
+            workbook = writer.book
+            worksheet = writer.sheets["Invoice"]
 
-st.divider()
-st.caption("Invoice PDF to Excel | Aplikasi terpisah dari sistem Surat Jalan OXAR GLOBAL")
+            # Format header
+            for cell in worksheet[1]:
+                cell.font = cell.font.copy(
+                    bold=True
+                )
+
+            # Lebar kolom
+            widths = {
+                "A": 8,
+                "B": 18,
+                "C": 35,
+                "D": 20,
+                "E": 25,
+                "F": 18,
+                "G": 20,
+                "H": 25,
+            }
+
+            for column, width in widths.items():
+                worksheet.column_dimensions[
+                    column
+                ].width = width
+
+            # Format nominal
+            for cell in worksheet["F"][1:]:
+                cell.number_format = '#,##0'
+
+        output.seek(0)
+
+        st.download_button(
+            label="⬇️ Download Excel",
+            data=output.getvalue(),
+            file_name="hasil_invoice.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            type="primary"
+        )
+
+    # ========================================================
+    # DEBUG
+    # ========================================================
+
+    debug_df = st.session_state.get(
+        "debug_data",
+        pd.DataFrame()
+    )
+
+    if not debug_df.empty:
+
+        with st.expander(
+            "🔎 Detail pembacaan PDF"
+        ):
+
+            st.dataframe(
+                debug_df,
+                use_container_width=True,
+                hide_index=True
+            )
