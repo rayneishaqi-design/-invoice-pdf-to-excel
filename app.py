@@ -45,6 +45,9 @@ BRANDS = [
     "Safwan",
     "Attaqwa",
     "Aqshor",
+    "Philips",
+    "Focallure",
+    "Pinkflash",
 ]
 
 # ============================================================
